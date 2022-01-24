@@ -1,5 +1,23 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 /*!
- *  Copyright (c) 2015 by Contributors
  * \file operator.h
  * \brief Operator interface of mxnet.
  * \author Naiyan Wang
@@ -11,57 +29,19 @@
 #include <dmlc/json.h>
 #include <dmlc/logging.h>
 #include <dmlc/registry.h>
+#include <nnvm/node.h>
 #include <vector>
 #include <map>
 #include <string>
 #include <utility>
 #include "./base.h"
 #include "./resource.h"
+#include "./op_attr_types.h"
 
 namespace mxnet {
-/*! \brief operation request type to Forward and Backward */
-enum OpReqType {
-  /*! \brief no operation, do not write anything */
-  kNullOp,
-  /*! \brief write gradient to provided space */
-  kWriteTo,
-  /*!
-   * \brief perform an inplace write,
-   * Target shares memory with one of input arguments.
-   * This option only happen when
-   */
-  kWriteInplace,
-  /*! \brief add to the provided space */
-  kAddTo
-};
-
-/*!
- * \brief All the possible information needed by Operator.Forward and Backward
- *  This is the superset of RunContext.
- *  We use this data structure to bookkeep everything needed by Forward and Backward.
- * \sa Resource
- */
-struct OpContext {
-  /*! \brief whether it is training phase */
-  int is_train;
-  /*! \brief RunContext related resources */
-  RunContext run_ctx;
-  /*! \brief Resources requested by the operator */
-  std::vector<Resource> requested;
-  /*!
-   * \brief get mshadow stream from Context
-   * \return the mshadow stream
-   * \tparam xpu the device type of the stream
-   */
-  template<typename xpu>
-  inline mshadow::Stream<xpu>* get_stream() const {
-    return run_ctx.get_stream<xpu>();
-  }
-};
-
 /*!
  * \brief Operator interface.
- *  Operator defins basic operation unit of optimized computation graph in mxnet.
+ *  Operator defines basic operation unit of optimized computation graph in mxnet.
  *  This interface relies on pre-allocated memory in TBlob, the caller need to set
  *  the memory region in TBlob correctly before calling Forward and Backward.
  *
@@ -69,7 +49,7 @@ struct OpContext {
  *  To add new operator(aka. layers of neural nets) to mxnet, developer need to create
  *  a new OperatorProperty and its corresponding Operator.
  *
- * \sa TBlob, TShape, OperatorProperty
+ * \sa TBlob, mxnet::TShape, OperatorProperty
  */
 class Operator {
  public:
@@ -86,11 +66,11 @@ class Operator {
    *        need, epecial case like Batch Norm requires.
    * \sa OpReqType, OpContext
    */
-  virtual void Forward(const OpContext &ctx,
-                       const std::vector<TBlob> &in_data,
-                       const std::vector<OpReqType> &req,
-                       const std::vector<TBlob> &out_data,
-                       const std::vector<TBlob> &aux_states) = 0;
+  virtual void Forward(const OpContext& ctx,
+                       const std::vector<TBlob>& in_data,
+                       const std::vector<OpReqType>& req,
+                       const std::vector<TBlob>& out_data,
+                       const std::vector<TBlob>& aux_states) = 0;
   /*!
    * \brief Perform a Backward Operation, write gradient to the in_grad.
    *
@@ -119,14 +99,19 @@ class Operator {
    * \param aux_states Auxiliary states of operator. Normally operator doesn't need
    * \sa OperatorProperty, OpReqType, OpContext
    */
-  virtual void Backward(const OpContext &ctx,
-                        const std::vector<TBlob> &out_grad,
-                        const std::vector<TBlob> &in_data,
-                        const std::vector<TBlob> &out_data,
-                        const std::vector<OpReqType> &req,
-                        const std::vector<TBlob> &in_grad,
-                        const std::vector<TBlob> &aux_states) {
+  virtual void Backward(const OpContext& ctx,
+                        const std::vector<TBlob>& out_grad,
+                        const std::vector<TBlob>& in_data,
+                        const std::vector<TBlob>& out_data,
+                        const std::vector<OpReqType>& req,
+                        const std::vector<TBlob>& in_grad,
+                        const std::vector<TBlob>& aux_states) {
     LOG(FATAL) << "Backward is not implemented";
+  }
+  /*! \return [Deprecated] execution type of the operator */
+  virtual ExecType exec_type()  // NOLINT(*) exec_type has been moved to OperatorProperty
+      const final {             // NOLINT(*) exec_type has been moved to OperatorProperty
+    return ExecType::kSync;
   }
 };
 
@@ -171,7 +156,7 @@ class OperatorProperty {
     return {"output"};
   }
   /*!
-   * \brief Get name of auxilary states of Operator
+   * \brief Get name of auxiliary states of Operator
    * \return name of return values.
    */
   virtual std::vector<std::string> ListAuxiliaryStates() const {
@@ -179,7 +164,7 @@ class OperatorProperty {
   }
   /*! \return number of real return values of the Operator */
   virtual int NumOutputs() const {
-    return 1;
+    return this->ListOutputs().size();
   }
   /*!
    * \brief get number of visible return values during Symbol creation.
@@ -204,18 +189,59 @@ class OperatorProperty {
    *     For unknown shapes, InferShape will try to fill in the correct Shape in in_shape
    *     For known shapes, InferShape will check shape consistency
    *
-   *     common practice: set the shape of data input, and usually weight's shape can be infered
+   *     common practice: set the shape of data input, and usually weight's shape can be inferred
    *
    * \param out_shape the shape of outputs of the operator
-   *     InferShape will modify the vector to fill output TShape
+   *     InferShape will modify the vector to fill output mxnet::TShape
    * \param aux_shape the shape of auxiliary states of the operator
-   *     InferShape will modify the vector to fill output TShape
+   *     InferShape will modify the vector to fill output mxnet::TShape
    * \return true if the shape inference is successful, false if there is not enough information.
    * \throws dmlc::Error if the known arg_shapes are inconsistent.
    */
-  virtual bool InferShape(std::vector<TShape> *in_shape,
-                          std::vector<TShape> *out_shape,
-                          std::vector<TShape> *aux_shape) const = 0;
+  virtual bool InferShape(mxnet::ShapeVector* in_shape,
+                          mxnet::ShapeVector* out_shape,
+                          mxnet::ShapeVector* aux_shape) const = 0;
+  /*!
+   * \brief infer the data types of outputs and unknown input arguments
+   * \param in_type the type of input arguments of the operator
+   *     this should be of same length as the vector returned by DescribeArgs
+   *     in_type allows unknown elements, which are checked by type.ndim() == 0.
+   *     For unknown types, Infertype will try to fill in the correct type in in_type
+   *     For known types, Infertype will check type consistency
+   *
+   *     common practice: set the type of data input, and usually weight's type can be inferred
+   *
+   * \param out_type the type of outputs of the operator
+   *     Infertype will modify the vector to fill output Ttype
+   * \param aux_type the type of auxiliary states of the operator
+   *     Infertype will modify the vector to fill output Ttype
+   * \return true if the type inference is successful, false if there is not enough information.
+   * \throws dmlc::Error if the known arg_types are inconsistent.
+   */
+  virtual bool InferType(std::vector<int>* in_type,
+                         std::vector<int>* out_type,
+                         std::vector<int>* aux_type) const {
+    CHECK_LE(in_type->size(), this->ListArguments().size());
+    int n_in = this->ListArguments().size();
+    for (unsigned i = 0; i < in_type->size(); ++i) {
+      CHECK(in_type->at(i) == mshadow::default_type_flag || in_type->at(i) == -1)
+          << "Unsupported data type " << in_type->at(i);
+    }
+    in_type->clear();
+    for (int i = 0; i < n_in; ++i)
+      in_type->push_back(mshadow::default_type_flag);
+
+    int n_out = this->ListOutputs().size();
+    out_type->clear();
+    for (int i = 0; i < n_out; ++i)
+      out_type->push_back(mshadow::default_type_flag);
+
+    int n_aux = this->ListAuxiliaryStates().size();
+    aux_type->clear();
+    for (int i = 0; i < n_aux; ++i)
+      aux_type->push_back(mshadow::default_type_flag);
+    return true;
+  }
   /*!
    * \brief Copy this OperatorProperty.
    * \return a pointer to the copied OperatorProperty
@@ -225,6 +251,26 @@ class OperatorProperty {
    * \brief Create a Operator on specific context
    */
   virtual Operator* CreateOperator(Context ctx) const = 0;
+  /*!
+   * \brief Create a Operator on specific context and input shape/type
+   * \param ctx context of this operator
+   * \param in_shape shape of the input ndarrays
+   * \param in_type dtype of the input ndarrays
+   * \return the created operator
+   */
+  virtual Operator* CreateOperatorEx(Context ctx,
+                                     mxnet::ShapeVector* in_shape,
+                                     std::vector<int>* in_type) const {
+    std::vector<int> out_type, aux_type;
+    mxnet::ShapeVector out_shape, aux_shape;
+    out_type.resize(this->ListOutputs().size());
+    out_shape.resize(this->ListOutputs().size());
+    aux_type.resize(this->ListAuxiliaryStates().size());
+    aux_shape.resize(this->ListAuxiliaryStates().size());
+    CHECK(InferType(in_type, &out_type, &aux_type));
+    CHECK(InferShape(in_shape, &out_shape, &aux_shape));
+    return CreateOperator(ctx);
+  }
   /*!
    * \brief return the type string of the Operator
    *  subclasses override this function.
@@ -241,19 +287,17 @@ class OperatorProperty {
    * \param in_shape The input shape to the operator, corresponds to shapes of in_data.
    * \return Additional resource request
    */
-  virtual std::vector<ResourceRequest> ForwardResource(
-      const std::vector<TShape> &in_shape) const {
+  virtual std::vector<ResourceRequest> ForwardResource(const mxnet::ShapeVector& in_shape) const {
     return std::vector<ResourceRequest>();
   }
   /*!
-   * \brief Decalre additional resource required in backward pass.
+   * \brief Declare additional resource required in backward pass.
    *  These additional resources will be presented in OpContext.requested
    *  in the same order of the returned Resource.
    * \param in_shape The input shape to the operator, corresponds to shapes of in_data.
    * \return Additional resource request
    */
-  virtual std::vector<ResourceRequest> BackwardResource(
-      const std::vector<TShape> &in_shape) const {
+  virtual std::vector<ResourceRequest> BackwardResource(const mxnet::ShapeVector& in_shape) const {
     return std::vector<ResourceRequest>();
   }
   /*!
@@ -261,7 +305,7 @@ class OperatorProperty {
    *
    *  Only the returned list of variables will be used in Backward.
    *  This function is used for memory optimization.
-   *  It is adviced to override and only return what is actually needed.
+   *  It is advised to override and only return what is actually needed.
    *  If this function is not overriden, all the variables will be valid in Backward.
    *
    * \code
@@ -278,10 +322,9 @@ class OperatorProperty {
    * \return an integer vector indicating the input requirments
    * \sa BackwardInputs
    */
-  virtual std::vector<int> DeclareBackwardDependency(
-      const std::vector<int> &out_grad,
-      const std::vector<int> &in_data,
-      const std::vector<int> &out_data) const {
+  virtual std::vector<int> DeclareBackwardDependency(const std::vector<int>& out_grad,
+                                                     const std::vector<int>& in_data,
+                                                     const std::vector<int>& out_data) const {
     // By default requires to see all the things.
     // remember to override this function to get a better performance.
     std::vector<int> ret = out_grad;
@@ -311,8 +354,8 @@ class OperatorProperty {
    *   indicating possible in place operations.
    */
   virtual std::vector<std::pair<int, void*> > ForwardInplaceOption(
-      const std::vector<int> &in_data,
-      const std::vector<void*> &out_data) const {
+      const std::vector<int>& in_data,
+      const std::vector<void*>& out_data) const {
     return std::vector<std::pair<int, void*> >();
   }
   /*!
@@ -342,10 +385,10 @@ class OperatorProperty {
    *   indicating possible in place operations.
    */
   virtual std::vector<std::pair<int, void*> > BackwardInplaceOption(
-      const std::vector<int> &out_grad,
-      const std::vector<int> &in_data,
-      const std::vector<int> &out_data,
-      const std::vector<void*> &in_grad) const {
+      const std::vector<int>& out_grad,
+      const std::vector<int>& in_data,
+      const std::vector<int>& out_data,
+      const std::vector<void*>& in_grad) const {
     return std::vector<std::pair<int, void*> >();
   }
   /*!
@@ -360,10 +403,10 @@ class OperatorProperty {
    * \return vector of inputs the Backward Operation depends on.
    * \sa DeclareBackwardDependency
    */
-  template<typename T>
-  inline std::vector<T> BackwardInputs(const std::vector<T> &out_grad,
-                                       const std::vector<T> &in_data,
-                                       const std::vector<T> &out_data) const {
+  template <typename T>
+  inline std::vector<T> BackwardInputs(const std::vector<T>& out_grad,
+                                       const std::vector<T>& in_data,
+                                       const std::vector<T>& out_data) const {
     int counter = 0;
     std::vector<int> out_grad_index(out_grad.size());
     std::vector<int> in_data_index(in_data.size());
@@ -382,8 +425,8 @@ class OperatorProperty {
     all_data.insert(all_data.end(), in_data.begin(), in_data.end());
     all_data.insert(all_data.end(), out_data.begin(), out_data.end());
 
-    std::vector<int> ret_index = this->DeclareBackwardDependency(
-        out_grad_index, in_data_index, out_data_index);
+    std::vector<int> ret_index =
+        this->DeclareBackwardDependency(out_grad_index, in_data_index, out_data_index);
 
     std::vector<T> ret(ret_index.size());
     for (size_t i = 0; i < ret_index.size(); ++i) {
@@ -396,17 +439,20 @@ class OperatorProperty {
    * \param type_name the type string of the OperatorProperty
    * \return a new constructed OperatorProperty
    */
-  static OperatorProperty *Create(const char* type_name);
+  static OperatorProperty* Create(const char* type_name);
+  /*! \return execution type of the operator */
+  virtual ExecType exec_type() const {
+    return ExecType::kSync;
+  }
 };
 
 /*! \brief typedef the factory function of operator property */
-typedef OperatorProperty *(*OperatorPropertyFactory)();
+typedef std::function<OperatorProperty*()> OperatorPropertyFactory;
 /*!
  * \brief Registry entry for OperatorProperty factory functions.
  */
 struct OperatorPropertyReg
-    : public dmlc::FunctionRegEntryBase<OperatorPropertyReg,
-                                        OperatorPropertyFactory> {
+    : public dmlc::FunctionRegEntryBase<OperatorPropertyReg, OperatorPropertyFactory> {
   /*!
    * \brief Set key_var_num_args
    *  When this is set, the API caller is required to pass in a
@@ -419,7 +465,7 @@ struct OperatorPropertyReg
    *
    * \param key the key name to be set
    */
-  inline OperatorPropertyReg& set_key_var_num_args(const std::string &key) {  // NOLINT(*)
+  inline OperatorPropertyReg& set_key_var_num_args(const std::string& key) {  // NOLINT(*)
     this->key_var_num_args = key;
     return *this;
   }
@@ -427,12 +473,12 @@ struct OperatorPropertyReg
    * \brief Check if TypeString of the type matches the registered name
    */
   inline OperatorPropertyReg& check_name() {
-    OperatorProperty *p = this->body();
-    std::string type = p->TypeString();
+    OperatorProperty* p = this->body();
+    std::string type    = p->TypeString();
     delete p;
-    CHECK_EQ(this->name, type)
-        << "Register Name and TypeString mismatch, name=\"" << this->name << "\","
-        << " but TypeString=\"" << type <<"\"";
+    CHECK_EQ(this->name, type) << "Register Name and TypeString mismatch, name=\"" << this->name
+                               << "\","
+                               << " but TypeString=\"" << type << "\"";
     return *this;
   }
 
@@ -440,9 +486,10 @@ struct OperatorPropertyReg
   std::string key_var_num_args;
 };
 
-//--------------------------------------------------------------
+//---------------------------------------------------------------------------------
 // The following part are API Registration of Operators
-//--------------------------------------------------------------
+// See also MXNET_REGISTER_SIMPLE_OP in operator_util.h for registering simple ops.
+//---------------------------------------------------------------------------------
 /*!
  * \brief Macro to register OperatorProperty
  *
@@ -453,14 +500,11 @@ struct OperatorPropertyReg
  *
  * \endcode
  */
-#define MXNET_REGISTER_OP_PROPERTY(name, OperatorPropertyType)          \
-  static ::mxnet::OperatorProperty* __create__ ## OperatorProperty ## name ## __() { \
-    OperatorProperty* ret = new OperatorPropertyType();                 \
-    return ret;                                                         \
-  }                                                                     \
+#define MXNET_REGISTER_OP_PROPERTY(name, OperatorPropertyType)                    \
   DMLC_REGISTRY_REGISTER(::mxnet::OperatorPropertyReg, OperatorPropertyReg, name) \
-  .set_body(__create__ ## OperatorProperty ## name ## __)               \
-  .check_name()
+      .set_body([]() { return new OperatorPropertyType(); })                      \
+      .set_return_type("NDArray-or-Symbol")                                       \
+      .check_name()
 
 #endif  // DMLC_USE_CXX11
 }  // namespace mxnet

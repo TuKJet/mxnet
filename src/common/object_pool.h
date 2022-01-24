@@ -1,6 +1,22 @@
-/*!
- * Copyright (c) 2015 by Contributors
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
  */
+
 #ifndef MXNET_COMMON_OBJECT_POOL_H_
 #define MXNET_COMMON_OBJECT_POOL_H_
 #include <dmlc/logging.h>
@@ -40,6 +56,12 @@ class ObjectPool {
    * \return Object Pool.
    */
   static ObjectPool* Get();
+
+  /*!
+   * \brief Get a shared ptr of the singleton instance of pool.
+   * \return Shared pointer to the Object Pool.
+   */
+  static const std::shared_ptr<ObjectPool>& _GetSharedRef();
 
  private:
   /*!
@@ -107,10 +129,13 @@ struct ObjectPoolAllocatable {
 
 template <typename T>
 ObjectPool<T>::~ObjectPool() {
-  // TODO(hotpxl): mind destruction order
-  // for (auto i : allocated_) {
-  //   free(i);
-  // }
+  for (auto i : allocated_) {
+#ifdef _MSC_VER
+    _aligned_free(i);
+#else
+    free(i);
+#endif
+  }
 }
 
 template <typename T>
@@ -122,7 +147,7 @@ T* ObjectPool<T>::New(Args&&... args) {
     if (head_->next == nullptr) {
       AllocateChunk();
     }
-    ret = head_;
+    ret   = head_;
     head_ = head_->next;
   }
   return new (static_cast<void*>(ret)) T(std::forward<Args>(args)...);
@@ -135,14 +160,19 @@ void ObjectPool<T>::Delete(T* ptr) {
   {
     std::lock_guard<std::mutex> lock{m_};
     linked_list_ptr->next = head_;
-    head_ = linked_list_ptr;
+    head_                 = linked_list_ptr;
   }
 }
 
 template <typename T>
 ObjectPool<T>* ObjectPool<T>::Get() {
-  static ObjectPool<T> inst;
-  return &inst;
+  return _GetSharedRef().get();
+}
+
+template <typename T>
+const std::shared_ptr<ObjectPool<T> >& ObjectPool<T>::_GetSharedRef() {
+  static std::shared_ptr<ObjectPool<T> > inst_ptr(new ObjectPool<T>());
+  return inst_ptr;
 }
 
 template <typename T>
@@ -157,16 +187,21 @@ void ObjectPool<T>::AllocateChunk() {
   static_assert(alignof(LinkedList) % alignof(T) == 0, "ObjectPooll Invariant");
   static_assert(kPageSize % alignof(LinkedList) == 0, "ObjectPooll Invariant");
   void* new_chunk_ptr;
+#ifdef _MSC_VER
+  new_chunk_ptr = _aligned_malloc(kPageSize, kPageSize);
+  CHECK(new_chunk_ptr != nullptr) << "Allocation failed";
+#else
   int ret = posix_memalign(&new_chunk_ptr, kPageSize, kPageSize);
   CHECK_EQ(ret, 0) << "Allocation failed";
+#endif
   allocated_.emplace_back(new_chunk_ptr);
   auto new_chunk = static_cast<LinkedList*>(new_chunk_ptr);
-  auto size = kPageSize / sizeof(LinkedList);
+  auto size      = kPageSize / sizeof(LinkedList);
   for (std::size_t i = 0; i < size - 1; ++i) {
     new_chunk[i].next = &new_chunk[i + 1];
   }
   new_chunk[size - 1].next = head_;
-  head_ = new_chunk;
+  head_                    = new_chunk;
 }
 
 template <typename T>

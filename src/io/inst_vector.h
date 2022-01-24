@@ -1,5 +1,23 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 /*!
- *  Copyright (c) 2015 by Contributors
  * \file inst_vector.h
  * \brief holder of a sequence of DataInst in CPU
  *        that are not necessarily of same shape
@@ -10,6 +28,7 @@
 
 #include <mxnet/io.h>
 #include <mxnet/base.h>
+#include <mxnet/tensor_blob.h>
 #include <dmlc/base.h>
 #include <mshadow/tensor.h>
 #include <vector>
@@ -20,21 +39,21 @@ namespace io {
 /*!
  * \brief a vector of tensor with various shape
  *
- * data are stored in memory continously
+ * data are stored in memory continuously
  */
-template<int dim, typename DType>
+template <int dim, typename DType>
 class TensorVector {
  public:
   TensorVector(void) {
     this->Clear();
   }
   /*! \brief get the buffer to the i-th tensor */
-  inline mshadow::Tensor<cpu, dim, DType>
-  operator[](size_t i) const {
+  inline mshadow::Tensor<cpu, dim, DType> operator[](size_t i) const {
     CHECK_LT(i + 1, offset_.size());
     CHECK_EQ(shape_[i].Size(), offset_[i + 1] - offset_[i]);
-    return mshadow::Tensor<cpu, dim, DType>
-        ((DType*)dmlc::BeginPtr(content_) + offset_[i], shape_[i]);  // NOLINT(*)
+    return mshadow::Tensor<cpu, dim, DType>(
+        (DType*)dmlc::BeginPtr(content_) + offset_[i],  // NOLINT(*)
+        shape_[i]);                                     // NOLINT(*)
   }
   inline mshadow::Tensor<cpu, dim, DType> Back() const {
     return (*this)[Size() - 1];
@@ -67,6 +86,7 @@ class TensorVector {
 /*!
  * \brief a list of (label, example) pairs, examples can have various shape
  */
+template <typename DType = real_t>
 class InstVector {
  public:
   /*! \brief return the number of (label, example) pairs */
@@ -82,6 +102,10 @@ class InstVector {
   inline DataInst operator[](size_t i) const {
     DataInst inst;
     inst.index = index_[i];
+    // ImageRecordIter depends on data vector
+    // here having size 2. If you want to
+    // change this assumption here, change it
+    // in there as well (InitBatch section)!
     inst.data.push_back(TBlob(data_[i]));
     inst.data.push_back(TBlob(label_[i]));
     return inst;
@@ -99,15 +123,13 @@ class InstVector {
    * \brief push a (label, example) pair
    * only reserved the space, while the data is not copied
    */
-  inline void Push(unsigned index,
-                   mshadow::Shape<3> dshape,
-                   mshadow::Shape<1> lshape) {
+  inline void Push(unsigned index, mshadow::Shape<3> dshape, mshadow::Shape<1> lshape) {
     index_.push_back(index);
     data_.Push(dshape);
     label_.Push(lshape);
   }
   /*! \return the data content */
-  inline const TensorVector<3, real_t>& data() const {
+  inline const TensorVector<3, DType>& data() const {
     return data_;
   }
   /*! \return the label content */
@@ -119,7 +141,7 @@ class InstVector {
   /*! \brief index of the data */
   std::vector<unsigned> index_;
   // label
-  TensorVector<3, real_t> data_;
+  TensorVector<3, DType> data_;
   // data
   TensorVector<1, real_t> label_;
 };
@@ -132,11 +154,12 @@ class InstVector {
 struct TBlobBatch {
  public:
   /*! \brief unique id for instance, can be NULL, sometimes is useful */
-  unsigned *inst_index;
+  unsigned* inst_index;
   /*! \brief number of instance */
   mshadow::index_t batch_size;
   /*! \brief number of padding elements in this batch,
-       this is used to indicate the last elements in the batch are only padded up to match the batch, and should be discarded */
+       this is used to indicate the last elements in the batch are only padded up to match the
+     batch, and should be discarded */
   mshadow::index_t num_batch_padd;
   /*! \brief content of dense data */
   std::vector<TBlob> data;
@@ -144,14 +167,63 @@ struct TBlobBatch {
   std::string extra_data;
   /*! \brief constructor */
   TBlobBatch(void) {
-    inst_index = NULL;
-    batch_size = 0; num_batch_padd = 0;
+    inst_index     = nullptr;
+    batch_size     = 0;
+    num_batch_padd = 0;
   }
   /*! \brief destructor */
   ~TBlobBatch() {
-    delete inst_index;
+    delete[] inst_index;
   }
 };  // struct TBlobBatch
+
+class TBlobContainer : public TBlob {
+ public:
+  TBlobContainer(void) : TBlob(), tensor_container_(nullptr) {}
+  ~TBlobContainer() {
+    if (tensor_container_) {
+      release();
+    }
+  }
+  void resize(const mxnet::TShape& shape, int type_flag) {
+    if (tensor_container_) {
+      CHECK_EQ(this->type_flag_, type_flag);
+      this->shape_ = shape;
+      resize();
+    } else {
+      this->type_flag_ = type_flag;
+      this->shape_     = shape;
+      create();
+    }
+  }
+
+ private:
+  void create() {
+    CHECK(tensor_container_ == nullptr);
+    CHECK_EQ(this->dev_mask(), mshadow::cpu::kDevMask);
+    MSHADOW_TYPE_SWITCH(this->type_flag_, DType, {
+      auto tensor_container = new mshadow::TensorContainer<mshadow::cpu, 1, DType>(false);
+      tensor_container->Resize(mshadow::Shape1(shape_.Size()));
+      dptr_             = tensor_container->dptr_;
+      tensor_container_ = tensor_container;
+    });
+  }
+  void resize() {
+    MSHADOW_TYPE_SWITCH(this->type_flag_, DType, {
+      auto tensor_container = (mshadow::TensorContainer<mshadow::cpu, 1, DType>*)tensor_container_;
+      tensor_container->Resize(mshadow::Shape1(shape_.Size()));
+    });
+  }
+  void release() {
+    MSHADOW_TYPE_SWITCH(this->type_flag_, DType, {
+      auto tensor_container = (mshadow::TensorContainer<mshadow::cpu, 1, DType>*)tensor_container_;
+      delete tensor_container;
+    });
+  }
+
+  void* tensor_container_;
+};
+
 }  // namespace io
 }  // namespace mxnet
 #endif  // MXNET_IO_INST_VECTOR_H_
